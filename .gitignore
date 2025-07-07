@@ -1,4 +1,7 @@
 data/train
 data/test
 dataset/wav
-dataset/transcript
+model/hubert-base/chinese-hubert-base-fairseq-ckpt.pt
+model/hubert-base/pytorch_model.bin
+model/wav2vec-base/pytorch_model.bin
+model/wav2vec-base/chinese-wav2vec2-base-fairseq-ckpt.pt
