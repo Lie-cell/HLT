@@ -24,7 +24,7 @@ class Config:
     
     # 模型参数
     hubert_model_path = "model-pre/hubert-base"
-    vq_codebook_size = 512
+    vq_codebook_size = 1024
     embedding_dim = 768
     max_audio_len = 96000  # 6s for 16kHz
     max_text_len = 50
@@ -184,6 +184,60 @@ class VectorQuantizer(nn.Module):
         
         return quantized, loss, encoding_indices.squeeze()
 
+class EnhancedLeadCharPredictor(nn.Module):
+    def __init__(self, embedding_dim, vocab_size):
+        super().__init__()
+        # 时序特征提取
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(embedding_dim, 512, kernel_size=3, padding=1),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
+            nn.Conv1d(512, 512, kernel_size=3, padding=1),
+            nn.BatchNorm1d(512),
+            nn.GELU()
+        )
+        
+        # 注意力机制
+        self.attention = nn.MultiheadAttention(512, num_heads=8, batch_first=True)
+        
+        # 双向LSTM
+        self.lstm = nn.LSTM(
+            input_size=512,
+            hidden_size=256,
+            num_layers=2,
+            bidirectional=True,
+            batch_first=True
+        )
+        
+        # 输出层
+        self.fc = nn.Sequential(
+            nn.Linear(1024, 256),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, vocab_size * 2)
+        )
+
+    def forward(self, x):
+        """输入形状: (batch_size, seq_len, embedding_dim)"""
+        # 1. 调整维度用于卷积
+        x = x.permute(0, 2, 1)  # (batch, embedding_dim, seq_len)
+        
+        # 2. 时序卷积提取局部特征
+        conv_out = self.temporal_conv(x)
+        conv_out = conv_out.permute(0, 2, 1)  # (batch, seq_len, 512)
+        
+        # 3. 注意力机制聚焦关键信息
+        attn_out, _ = self.attention(conv_out, conv_out, conv_out)
+        
+        # 4. 双向LSTM捕获长时依赖
+        lstm_out, _ = self.lstm(attn_out)
+        
+        # 5. 取序列首尾特征（包含开始和结束信息）
+        context = torch.cat([lstm_out[:, 0], lstm_out[:, -1]], dim=1)
+        
+        # 6. 预测前两个字符
+        return self.fc(context).reshape(-1, 2, self.fc[-1].out_features // 2)
+        
 # 端到端模型
 class VQVAEASR(nn.Module):
     def __init__(self, hubert_model, vq_codebook_size, embedding_dim, vocab_size):
@@ -219,16 +273,15 @@ class VQVAEASR(nn.Module):
             num_layers=4
         )
 
-        self.lead_char_predictor = nn.Sequential(
-            nn.Linear(embedding_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, vocab_size * 2)  # 预测前两个汉字
+        self.lead_char_predictor = EnhancedLeadCharPredictor(
+            embedding_dim, 
+            vocab_size
         )
 
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(embedding_dim * 2, embedding_dim),
-            nn.Sigmoid()  # 生成0-1的融合权重
-        )
+        # self.fusion_gate = nn.Sequential(
+        #     nn.Linear(embedding_dim * 2, embedding_dim),
+        #     nn.Sigmoid()  # 生成0-1的融合权重
+        # )
         
         # 嵌入层和输出层
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
@@ -249,26 +302,26 @@ class VQVAEASR(nn.Module):
         encodeed_indices = embedding_layer(encodedd)
         encodeed_indices = encodeed_indices.reshape(batch_size, seq_len, feat_dim)
         # quantized = quantized.reshape(batch_size, seq_len, feat_dim)  # 使用reshape代替view
-        lead_logits = self.lead_char_predictor(encodeed_indices.mean(dim=1)).reshape(batch_size, 2, self.vocab_size)  # [B, 2, vocab_size]
+        lead_logits = self.lead_char_predictor(encodeed_indices).reshape(batch_size, 2, self.vocab_size)  # [B, 2, vocab_size]
         lead_emb = self.embedding(torch.argmax(lead_logits, dim=-1))
-        
+        concatenated_features = torch.cat([lead_emb, encodeed_indices], dim=1)
         ## 压缩声学特征为上下文向量 [B, D]
-        acoustic_context = encodeed_indices.mean(dim=1)  
+        # acoustic_context = encodeed_indices.mean(dim=1)  
         ## 广播前导嵌入至声学序列长度 [B, T, D]
-        lead_emb = lead_emb.view(lead_emb.size(0), -1)  # 形状变为 (16, 2 * 768)
+        # lead_emb = lead_emb.view(lead_emb.size(0), -1)  # 形状变为 (16, 2 * 768)
 
         # 创建目标形状的零张量
-        seq_len = encodeed_indices.size(1)  # 获取目标序列长度
-        lead_emb_expanded = torch.zeros((lead_emb.size(0), seq_len, 768), device=lead_emb.device)
+        # seq_len = encodeed_indices.size(1)  # 获取目标序列长度
+        # lead_emb_expanded = torch.zeros((lead_emb.size(0), seq_len, 768), device=lead_emb.device)
 
-        # 填充目标张量
-        lead_emb_expanded[:, :2, :] = lead_emb.view(lead_emb.size(0), 2, 768) 
-        ## 门控融合 [B, T, D]
-        gate = self.fusion_gate(torch.cat([encodeed_indices, lead_emb_expanded], dim=-1))
-        fused_features = gate * encodeed_indices + (1 - gate) * lead_emb_expanded
+        # # 填充目标张量
+        # lead_emb_expanded[:, :2, :] = lead_emb.view(lead_emb.size(0), 2, 768) 
+        # ## 门控融合 [B, T, D]
+        # gate = self.fusion_gate(torch.cat([encodeed_indices, lead_emb_expanded], dim=-1))
+        # fused_features = gate * encodeed_indices + (1 - gate) * lead_emb_expanded
         
         # 步骤4：将融合特征输入Transformer
-        encoded = self.encoder(fused_features)  # 此处输入已包含前导信息
+        encoded = self.encoder(concatenated_features)  # 此处输入已包含前导信息
         
         # # 编码器处理
         # encoded = self.encoder(encodeed_indices)
@@ -423,7 +476,7 @@ def train(model, tokenizer, train_loader, val_loader, optimizer, scheduler):
             outputs = outputs[loss_mask]
             targets = targets[loss_mask]
             
-            asr_loss = F.cross_entropy(outputs, targets, ignore_index=tokenizer.pad_token_id)*0.35+lead_loss*0.65
+            asr_loss = F.cross_entropy(outputs, targets, ignore_index=tokenizer.pad_token_id)*0.75+lead_loss*0.25
             
             # 总损失
             total_loss = vq_weight * vq_loss + asr_weight * asr_loss
@@ -527,8 +580,8 @@ def validate(model, tokenizer, val_loader, epoch):
                 
                 if ref and hyp:
                     # CER：字符错误率
-                    char_errors = sum(1 for a, b in zip(ref, hyp) if a != b)
-                    total_cer += char_errors / max(len(ref), 1)
+                    #char_errors = sum(1 for a, b in zip(ref, hyp) if a != b)
+                    total_cer += jiwer.cer(ref , hyp)#char_errors / max(len(ref), 1)
                     # WER
                     total_wer = jiwer.wer(ref , hyp)
                     count += 1
@@ -575,8 +628,8 @@ def test(model, tokenizer, test_loader):
                 if ref and hyp:
                     # CER：字符错误率
                     # print(ref,"123",hyp)
-                    char_errors = sum(1 for a, b in zip(ref, hyp) if a != b)
-                    total_cer += char_errors / max(len(ref), 1)
+                    #char_errors = sum(1 for a, b in zip(ref, hyp) if a != b)
+                    total_cer += jiwer.cer(ref , hyp)#char_errors / max(len(ref), 1)
                     # WER：词错误率 
                     total_wer = jiwer.wer(ref , hyp)
                     count += 1
