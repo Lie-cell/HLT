@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import re
 from collections import Counter
 from tqdm import tqdm
+import jiwer
 
 # 配置参数
 class Config:
@@ -23,22 +24,22 @@ class Config:
     
     # 模型参数
     hubert_model_path = "model-pre/hubert-base"
-    vq_codebook_size = 128
+    vq_codebook_size = 512
     embedding_dim = 768
-    max_audio_len = 80000  # 10s for 16kHz
-    max_text_len = 128
+    max_audio_len = 96000  # 6s for 16kHz
+    max_text_len = 50
     
     # 训练参数
-    batch_size = 32
-    num_workers = 4
+    batch_size = 16
+    num_workers = 8
     lr = 1e-4
-    epochs = 20
+    epochs = 16
     save_dir = "model"
     report_dir = "report"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # 验证集划分
-    val_ratio = 0.025
+    val_ratio = 0.1
 
 config = Config()
 os.makedirs(config.save_dir, exist_ok=True)
@@ -232,11 +233,14 @@ class VQVAEASR(nn.Module):
         # VQ量化
         batch_size, seq_len, feat_dim = features.shape
         features = features.reshape(-1, feat_dim)  # 使用reshape代替view
-        quantized, vq_loss, _ = self.vq(features)
-        quantized = quantized.reshape(batch_size, seq_len, feat_dim)  # 使用reshape代替view
+        quantized, vq_loss, encoded = self.vq(features)
+        embedding_layer = nn.Embedding(config.vq_codebook_size, config.embedding_dim).to(config.device)
+        encodeed_indices = embedding_layer(encoded)
+        encodeed_indices = encodeed_indices.reshape(batch_size, seq_len, feat_dim)
+        # quantized = quantized.reshape(batch_size, seq_len, feat_dim)  # 使用reshape代替view
         
         # 编码器处理
-        encoded = self.encoder(quantized)
+        encoded = self.encoder(encodeed_indices)
         
         # 解码器处理
         if labels is not None:
@@ -299,6 +303,23 @@ class VQVAEASR(nn.Module):
 
 # 训练函数
 from tqdm import tqdm
+def calculate_weights(e, E):
+    # 计算各个阶段的 epoch 范围
+    first_stage_end = E * 6 // 16
+    second_stage_end = E * 10 // 16  # 6/16 + 4/16 = 10/16
+
+    if e <= first_stage_end:
+        # 第一阶段：从 0.95 线性衰减到 0.5
+        vq_weight = 0.95 - 0.45 * (e - 1) / (first_stage_end - 1)
+    elif e <= second_stage_end:
+        # 第二阶段：保持 0.5
+        vq_weight = 0.5
+    else:
+        # 第三阶段：从 0.5 线性衰减到 0.05
+        vq_weight = 0.5 - 0.45 * (e - second_stage_end) / (E - second_stage_end)
+    
+    asr_weight = 1 - vq_weight
+    return vq_weight, asr_weight
 
 def train(model, tokenizer, train_loader, val_loader, optimizer, scheduler):
     model.train()
@@ -323,7 +344,8 @@ def train(model, tokenizer, train_loader, val_loader, optimizer, scheduler):
         model.train()
         epoch_loss = 0
         step_count = 0
-        
+
+        vq_weight, asr_weight = calculate_weights(epoch + 1, config.epochs)
         # 使用 tqdm 创建进度条
         train_loader = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.epochs}", unit="batch")
         
@@ -357,7 +379,7 @@ def train(model, tokenizer, train_loader, val_loader, optimizer, scheduler):
             asr_loss = F.cross_entropy(outputs, targets, ignore_index=tokenizer.pad_token_id)
             
             # 总损失
-            total_loss = asr_loss + vq_loss
+            total_loss = vq_weight * vq_loss + asr_weight * asr_loss
             
             # 反向传播
             total_loss.backward()
@@ -372,7 +394,7 @@ def train(model, tokenizer, train_loader, val_loader, optimizer, scheduler):
         avg_train_loss = epoch_loss / step_count
         
         # 验证
-        val_loss, val_cer, val_wer = validate(model, tokenizer, val_loader)
+        val_loss, val_cer, val_wer = validate(model, tokenizer, val_loader ,epoch)
         
         # 更新学习率
         scheduler.step(val_loss)
@@ -404,7 +426,7 @@ def train(model, tokenizer, train_loader, val_loader, optimizer, scheduler):
     return model
 
 # 验证函数
-def validate(model, tokenizer, val_loader):
+def validate(model, tokenizer, val_loader, epoch):
     model.eval()
     total_loss = 0
     total_cer = 0
@@ -412,6 +434,7 @@ def validate(model, tokenizer, val_loader):
     count = 0
     
     with torch.no_grad():
+        val_loader = tqdm(val_loader, desc=f"Epoch {epoch + 1}/{config.epochs}", unit="batch")
         for batch in val_loader:
             input_values = batch["input_values"].to(config.device)
             attention_mask = batch["attention_mask"].to(config.device)
@@ -437,7 +460,7 @@ def validate(model, tokenizer, val_loader):
             targets = targets[loss_mask]
             
             asr_loss = F.cross_entropy(outputs, targets, ignore_index=tokenizer.pad_token_id)
-            total_loss += (asr_loss + vq_loss).item()
+            total_loss += (0.5*asr_loss + 0.5*vq_loss).item()
             
             # 生成预测
             encoded, _ = model(input_values, attention_mask)
@@ -450,19 +473,19 @@ def validate(model, tokenizer, val_loader):
                 pred_texts.append(text)
             
             # 计算指标
-            print(texts[0],"val0",pred_texts[0])
+            # print(texts[0],"val0",pred_texts[0])
             for i in range(len(texts)):
                 ref = texts[i]
                 hyp = pred_texts[i]
                 
                 if ref and hyp:
                     # CER：字符错误率
-                    
                     char_errors = sum(1 for a, b in zip(ref, hyp) if a != b)
                     total_cer += char_errors / max(len(ref), 1)
-                    # WER：词错误率（这里简化为句错误率）
-                    total_wer += 1 if ref != hyp else 0
+                    # WER
+                    total_wer = jiwer.wer(ref , hyp)
                     count += 1
+            val_loader.set_postfix({"Val Loss": f"{total_loss:.4f}"})
     
     avg_loss = total_loss / len(val_loader)
     avg_cer = total_cer / count if count else 1.0
@@ -495,7 +518,7 @@ def test(model, tokenizer, test_loader):
                 pred_texts.append(text)
             
             # 保存结果
-            print(texts,"test",pred_texts)
+            print(texts[0],"test",pred_texts[0])
             for i in range(len(texts)):
                 ref = texts[i]
                 hyp = pred_texts[i]
@@ -507,8 +530,8 @@ def test(model, tokenizer, test_loader):
                     # print(ref,"123",hyp)
                     char_errors = sum(1 for a, b in zip(ref, hyp) if a != b)
                     total_cer += char_errors / max(len(ref), 1)
-                    # WER：词错误率（这里简化为句错误率）
-                    total_wer += 1 if ref != hyp else 0
+                    # WER：词错误率 
+                    total_wer = jiwer.wer(ref , hyp)
                     count += 1
     
     # 计算最终指标
@@ -543,13 +566,7 @@ def main():
     
     # 重新加载完整训练数据集
     train_dataset = AISHELLDataset(config.train_dir, config.transcript_path)
-    # 计算子集的大小
-    subset_size = int(len(train_dataset) * 0.05)  # 10% 的数据
-    remaining_size = len(train_dataset) - subset_size
 
-    # 使用 random_split 划分子集
-    train_dataset, _ = random_split(train_dataset, [subset_size, remaining_size])
-    
     # 划分训练集和验证集
     val_size = int(len(train_dataset) * config.val_ratio)
     train_size = len(train_dataset) - val_size
@@ -601,7 +618,7 @@ def main():
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=2, verbose=True
     )
-    
+    # val_loss, val_cer, val_wer = validate(model, tokenizer, val_loader ,10)
     # 训练模型
     model = train(model, tokenizer, train_loader, val_loader, optimizer, scheduler)
     # checkpoint = torch.load(os.path.join(config.save_dir, "vqvae_asr_model.pt"), map_location=config.device)
@@ -613,4 +630,5 @@ def main():
     print(f"Test CER: {test_cer:.4f}, Test WER: {test_wer:.4f}")
 
 if __name__ == "__main__":
+    # print(config.device)
     main()
