@@ -149,17 +149,23 @@ class AISHELLDataset(Dataset):
         }
 
 # 向量量化层
-class VectorQuantizer(nn.Module):
-    def __init__(self, codebook_size, embedding_dim, commitment_cost=0.25):
+class VectorQuantizerEMA(nn.Module):
+    def __init__(self, codebook_size, embedding_dim, commitment_cost=0.25, decay=0.99, epsilon=1e-5):
         super().__init__()
         self.codebook_size = codebook_size
         self.embedding_dim = embedding_dim
         self.commitment_cost = commitment_cost
+        self.decay = decay
+        self.epsilon = epsilon
         
         # 初始化码本
         self.codebook = nn.Embedding(codebook_size, embedding_dim)
-        self.codebook.weight.data.uniform_(-1/codebook_size, 1/codebook_size)
-    
+        self.codebook.weight.data.normal_()
+        
+        # EMA统计量
+        self.register_buffer('_ema_cluster_size', torch.zeros(codebook_size))
+        self.register_buffer('_ema_w', self.codebook.weight.data.clone())
+
     def forward(self, inputs):
         # 计算输入与码本的距离
         distances = (torch.sum(inputs**2, dim=1, keepdim=True) 
@@ -167,76 +173,62 @@ class VectorQuantizer(nn.Module):
                     - 2 * torch.matmul(inputs, self.codebook.weight.t()))
         
         # 获取最近邻编码
-        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
-        encodings = torch.zeros(encoding_indices.shape[0], self.codebook_size, device=inputs.device)
-        encodings.scatter_(1, encoding_indices, 1)
+        encoding_indices = torch.argmin(distances, dim=1)
+        encodings = F.one_hot(encoding_indices, self.codebook_size).float()
         
         # 量化向量
         quantized = torch.matmul(encodings, self.codebook.weight)
         
-        # 计算损失
-        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
-        q_latent_loss = F.mse_loss(quantized, inputs.detach())
-        loss = q_latent_loss + self.commitment_cost * e_latent_loss
+        # EMA更新码本
+        if self.training:
+            # 更新EMA统计量
+            self._ema_cluster_size = (self.decay * self._ema_cluster_size 
+                                     + (1 - self.decay) * encodings.sum(0))
+            
+            # 拉普拉斯平滑防止码本坍塌
+            n = self._ema_cluster_size.sum()
+            smoothed_size = ((self._ema_cluster_size + self.epsilon)
+                           / (n + self.codebook_size * self.epsilon) * n)
+            
+            # 更新权重和
+            dw = torch.matmul(encodings.t(), inputs)
+            self._ema_w = self.decay * self._ema_w + (1 - self.decay) * dw
+            
+            # 应用平滑后的码本
+            self.codebook.weight.data = self._ema_w / smoothed_size.unsqueeze(1)
         
         # 直通估计器
         quantized = inputs + (quantized - inputs).detach()
         
-        return quantized, loss, encoding_indices.squeeze()
+        # 计算commitment损失
+        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
+        loss = self.commitment_cost * e_latent_loss
+        
+        return quantized, loss, encoding_indices
 
-class EnhancedLeadCharPredictor(nn.Module):
-    def __init__(self, embedding_dim, vocab_size):
-        super().__init__()
-        # 时序特征提取
-        self.temporal_conv = nn.Sequential(
-            nn.Conv1d(embedding_dim, 512, kernel_size=3, padding=1),
-            nn.BatchNorm1d(512),
-            nn.GELU(),
-            nn.Conv1d(512, 512, kernel_size=3, padding=1),
-            nn.BatchNorm1d(512),
-            nn.GELU()
+class LeadCharPredictor(nn.Module):
+    def __init__(self, embedding_dim, vocab_size, hidden_dim=512, num_layers=2):
+        super(LeadCharPredictor, self).__init__()
+        self.gru = nn.GRU(
+            input_size=embedding_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True
         )
-        
-        # 注意力机制
-        self.attention = nn.MultiheadAttention(512, num_heads=8, batch_first=True)
-        
-        # 双向LSTM
-        self.lstm = nn.LSTM(
-            input_size=512,
-            hidden_size=256,
-            num_layers=2,
-            bidirectional=True,
-            batch_first=True
-        )
-        
-        # 输出层
         self.fc = nn.Sequential(
-            nn.Linear(1024, 256),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, vocab_size * 2)
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, vocab_size * 2)  # 预测前两个字符
         )
 
     def forward(self, x):
-        """输入形状: (batch_size, seq_len, embedding_dim)"""
-        # 1. 调整维度用于卷积
-        x = x.permute(0, 2, 1)  # (batch, embedding_dim, seq_len)
-        
-        # 2. 时序卷积提取局部特征
-        conv_out = self.temporal_conv(x)
-        conv_out = conv_out.permute(0, 2, 1)  # (batch, seq_len, 512)
-        
-        # 3. 注意力机制聚焦关键信息
-        attn_out, _ = self.attention(conv_out, conv_out, conv_out)
-        
-        # 4. 双向LSTM捕获长时依赖
-        lstm_out, _ = self.lstm(attn_out)
-        
-        # 5. 取序列首尾特征（包含开始和结束信息）
-        context = torch.cat([lstm_out[:, 0], lstm_out[:, -1]], dim=1)
-        
-        # 6. 预测前两个字符
-        return self.fc(context).reshape(-1, 2, self.fc[-1].out_features // 2)
+        # x: [B, T, D]
+        _, h_n = self.gru(x)  # h_n: [2*num_layers, B, H]
+        # 取最后一层的正向和反向输出拼接
+        h_last = torch.cat((h_n[-2], h_n[-1]), dim=-1)  # [B, 2H]
+        out = self.fc(h_last)  # [B, vocab_size * 2]
+        return out
         
 # 端到端模型
 class VQVAEASR(nn.Module):
@@ -248,7 +240,12 @@ class VQVAEASR(nn.Module):
             param.requires_grad = False
         
         # VQ层
-        self.vq = VectorQuantizer(vq_codebook_size, embedding_dim)
+        self.vq = VectorQuantizerEMA(
+            codebook_size=vq_codebook_size,
+            embedding_dim=embedding_dim,
+            commitment_cost=0.25,
+            decay=0.99
+        )
         
         # Transformer编码器-解码器
         self.encoder = nn.TransformerEncoder(
@@ -273,10 +270,13 @@ class VQVAEASR(nn.Module):
             num_layers=4
         )
 
-        self.lead_char_predictor = EnhancedLeadCharPredictor(
-            embedding_dim, 
-            vocab_size
+        self.lead_char_predictor = LeadCharPredictor(
+            embedding_dim=embedding_dim,
+            vocab_size=vocab_size,
+            hidden_dim=512,  
+            num_layers=2     
         )
+
 
         # self.fusion_gate = nn.Sequential(
         #     nn.Linear(embedding_dim * 2, embedding_dim),
@@ -400,6 +400,7 @@ class VQVAEASR(nn.Module):
                 break
         
         return generated
+    
 
 # 训练函数
 from tqdm import tqdm
@@ -564,6 +565,7 @@ def validate(model, tokenizer, val_loader, epoch):
             # 生成预测
             encoded, _ = model(input_values, attention_mask)
             pred_ids = model.generate(encoded, max_length=config.max_text_len,lead_logits = lead_logits)
+
             
             # 解码预测
             pred_texts = []
@@ -656,11 +658,11 @@ def main():
     
     # 重新加载完整训练数据集
     train_dataset = AISHELLDataset(config.train_dir, config.transcript_path)
-    val_size1 = int(len(train_dataset) * 0.99)
-    train_size1 = len(train_dataset) - val_size1
-    train_dataset, _ = random_split(
-        train_dataset, [train_size1, val_size1]
-    )
+    # val_size1 = int(len(train_dataset) * 0.99)
+    # train_size1 = len(train_dataset) - val_size1
+    # train_dataset, _ = random_split(
+    #     train_dataset, [train_size1, val_size1]
+    # )
 
     # 划分训练集和验证集
     val_size = int(len(train_dataset) * config.val_ratio)
