@@ -437,7 +437,7 @@ def train(model, tokenizer, train_loader, val_loader, optimizer, scheduler):
         report_file.write(f"Learning Rate: {config.lr}\n")
         report_file.write(f"Epochs: {config.epochs}\n")
         report_file.write(f"Vocab Size: {tokenizer.vocab_size}\n\n")
-        report_file.write("Epoch\tTrain Loss\tVal Loss\tVal CER\tVal WER\tTime\n")
+        report_file.write("Epoch\tTrain Loss\tVal Loss\tVal CER\tTime\n")
     
     for epoch in range(config.epochs):
         epoch_start = time.time()
@@ -494,7 +494,7 @@ def train(model, tokenizer, train_loader, val_loader, optimizer, scheduler):
         avg_train_loss = epoch_loss / step_count
         
         # 验证
-        val_loss, val_cer, val_wer = validate(model, tokenizer, val_loader ,epoch)
+        val_loss, val_cer= validate(model, tokenizer, val_loader ,epoch)
         
         # 更新学习率
         scheduler.step(val_loss)
@@ -512,10 +512,10 @@ def train(model, tokenizer, train_loader, val_loader, optimizer, scheduler):
         # 记录训练信息
         epoch_time = time.time() - epoch_start
         with open(report_path, "a", encoding="utf-8") as report_file:
-            report_file.write(f"{epoch+1}\t{avg_train_loss:.4f}\t{val_loss:.4f}\t{val_cer:.4f}\t{val_wer:.4f}\t{epoch_time:.1f}s\n")
+            report_file.write(f"{epoch+1}\t{avg_train_loss:.4f}\t{val_loss:.4f}\t{val_cer:.4f}\t{epoch_time:.1f}s\n")
         
         print(f"Epoch {epoch+1}/{config.epochs} | Train Loss: {avg_train_loss:.4f} | "
-              f"Val Loss: {val_loss:.4f} | CER: {val_cer:.4f} | WER: {val_wer:.4f} | "
+              f"Val Loss: {val_loss:.4f} | CER: {val_cer:.4f} | "
               f"Time: {epoch_time:.1f}s")
     
     # 记录总训练时间
@@ -530,7 +530,6 @@ def validate(model, tokenizer, val_loader, epoch):
     model.eval()
     total_loss = 0
     total_cer = 0
-    total_wer = 0
     count = 0
     
     with torch.no_grad():
@@ -582,22 +581,18 @@ def validate(model, tokenizer, val_loader, epoch):
                     # CER：字符错误率
                     #char_errors = sum(1 for a, b in zip(ref, hyp) if a != b)
                     total_cer += jiwer.cer(ref , hyp)#char_errors / max(len(ref), 1)
-                    # WER
-                    total_wer = jiwer.wer(ref , hyp)
                     count += 1
             val_loader.set_postfix({"Val Loss": f"{total_loss:.4f}"})
     
     avg_loss = total_loss / len(val_loader)
     avg_cer = total_cer / count if count else 1.0
-    avg_wer = total_wer / count if count else 1.0
     
-    return avg_loss, avg_cer, avg_wer
+    return avg_loss, avg_cer
 
 # 测试函数
 def test(model, tokenizer, test_loader):
     model.eval()
     total_cer = 0
-    total_wer = 0
     count = 0
     results = []
     
@@ -630,19 +625,15 @@ def test(model, tokenizer, test_loader):
                     # print(ref,"123",hyp)
                     #char_errors = sum(1 for a, b in zip(ref, hyp) if a != b)
                     total_cer += jiwer.cer(ref , hyp)#char_errors / max(len(ref), 1)
-                    # WER：词错误率 
-                    total_wer = jiwer.wer(ref , hyp)
                     count += 1
     
     # 计算最终指标
     final_cer = total_cer / count if count else 1.0
-    final_wer = total_wer / count if count else 1.0
     
     # 保存测试结果
     result_path = os.path.join(config.report_dir, "vqvae_test_results.txt")
     with open(result_path, "w", encoding="utf-8") as f:
         f.write(f"Final CER: {final_cer:.4f}\n")
-        f.write(f"Final WER: {final_wer:.4f}\n\n")
         f.write("Detailed Results:\n\n")
         f.writelines(results)
     
@@ -651,9 +642,8 @@ def test(model, tokenizer, test_loader):
     with open(report_path, "a", encoding="utf-8") as report_file:
         report_file.write("\nTest Results:\n")
         report_file.write(f"CER: {final_cer:.4f}\n")
-        report_file.write(f"WER: {final_wer:.4f}\n")
     
-    return final_cer, final_wer
+    return final_cer
 
 # 主函数
 def main():
@@ -666,11 +656,11 @@ def main():
     
     # 重新加载完整训练数据集
     train_dataset = AISHELLDataset(config.train_dir, config.transcript_path)
-    # val_size1 = int(len(train_dataset) * 0.95)
-    # train_size1 = len(train_dataset) - val_size1
-    # train_dataset, _ = random_split(
-    #     train_dataset, [train_size1, val_size1]
-    # )
+    val_size1 = int(len(train_dataset) * 0.99)
+    train_size1 = len(train_dataset) - val_size1
+    train_dataset, _ = random_split(
+        train_dataset, [train_size1, val_size1]
+    )
 
     # 划分训练集和验证集
     val_size = int(len(train_dataset) * config.val_ratio)
@@ -723,7 +713,7 @@ def main():
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=2, verbose=True
     )
-    # val_loss, val_cer, val_wer = validate(model, tokenizer, val_loader ,10)
+    # val_loss, val_cer = validate(model, tokenizer, val_loader ,10)
     # 训练模型
     model = train(model, tokenizer, train_loader, val_loader, optimizer, scheduler)
     # checkpoint = torch.load(os.path.join(config.save_dir, "vqvae_asr_model.pt"), map_location=config.device)
@@ -731,8 +721,8 @@ def main():
     # model.load_state_dict(checkpoint['model_state_dict'])
     
     # 测试模型
-    test_cer, test_wer = test(model, tokenizer, test_loader)
-    print(f"Test CER: {test_cer:.4f}, Test WER: {test_wer:.4f}")
+    test_cer = test(model, tokenizer, test_loader)
+    print(f"Test CER: {test_cer:.4f}")
 
 if __name__ == "__main__":
     # print(config.device)
