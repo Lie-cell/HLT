@@ -7,4 +7,3 @@ model-pre/wav2vec-base/pytorch_model.bin
 model-pre/wav2vec-base/chinese-wav2vec2-base-fairseq-ckpt.pt
 2025年南开大学HLT实验室语音信息处理方向推免研究生夏令营科研题目.pdf
 model
-main.py
