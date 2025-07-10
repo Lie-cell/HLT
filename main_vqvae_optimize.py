@@ -270,11 +270,10 @@ class VQVAEASR(nn.Module):
             num_layers=4
         )
 
-        self.lead_char_predictor = LeadCharPredictor(
-            embedding_dim=embedding_dim,
-            vocab_size=vocab_size,
-            hidden_dim=512,  
-            num_layers=2     
+        self.lead_char_predictor = nn.Sequential(
+            nn.Linear(embedding_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, vocab_size * 2)  # 预测前两个汉字
         )
 
 
@@ -302,7 +301,7 @@ class VQVAEASR(nn.Module):
         encodeed_indices = embedding_layer(encodedd)
         encodeed_indices = encodeed_indices.reshape(batch_size, seq_len, feat_dim)
         # quantized = quantized.reshape(batch_size, seq_len, feat_dim)  # 使用reshape代替view
-        lead_logits = self.lead_char_predictor(encodeed_indices).reshape(batch_size, 2, self.vocab_size)  # [B, 2, vocab_size]
+        lead_logits = self.lead_char_predictor(encodeed_indices.means(dim = 1)).reshape(batch_size, 2, self.vocab_size)  # [B, 2, vocab_size]
         lead_emb = self.embedding(torch.argmax(lead_logits, dim=-1))
         concatenated_features = torch.cat([lead_emb, encodeed_indices], dim=1)
         ## 压缩声学特征为上下文向量 [B, D]
@@ -362,7 +361,7 @@ class VQVAEASR(nn.Module):
         # , align_loss
         else:
             # 推理模式
-            return encoded, vq_loss
+            return encoded, vq_loss , lead_logits
     
     def generate(self, encoded, lead_logits ,max_length=100, temperature=1.0 ):
         """自回归生成文本"""
@@ -544,26 +543,26 @@ def validate(model, tokenizer, val_loader, epoch):
             labels, _ = tokenizer.batch_encode(texts)
             labels = labels.to(config.device)
             
-            # 计算损失
-            outputs, vq_loss, targets , _ ,lead_logits = model(
-                input_values=input_values,
-                attention_mask=attention_mask,
-                labels=labels
-            )
+            # # 计算损失
+            # outputs, vq_loss, targets , _ ,lead_logits = model(
+            #     input_values=input_values,
+            #     attention_mask=attention_mask,
+            #     labels=labels
+            # )
             
-            outputs = outputs.reshape(-1, outputs.size(-1))  # 使用reshape代替view
-            targets = targets.reshape(-1)  # 使用reshape代替view
+            # outputs = outputs.reshape(-1, outputs.size(-1))  # 使用reshape代替view
+            # targets = targets.reshape(-1)  # 使用reshape代替view
             
-            # 忽略pad token的损失
-            loss_mask = targets != tokenizer.pad_token_id
-            outputs = outputs[loss_mask]
-            targets = targets[loss_mask]
+            # # 忽略pad token的损失
+            # loss_mask = targets != tokenizer.pad_token_id
+            # outputs = outputs[loss_mask]
+            # targets = targets[loss_mask]
             
-            asr_loss = F.cross_entropy(outputs, targets, ignore_index=tokenizer.pad_token_id)
-            total_loss += (0.5*asr_loss + 0.5*vq_loss).item()
+            # asr_loss = F.cross_entropy(outputs, targets, ignore_index=tokenizer.pad_token_id)
+            # total_loss += (0.5*asr_loss + 0.5*vq_loss).item()
             
             # 生成预测
-            encoded, _ = model(input_values, attention_mask)
+            encoded, _ , lead_logits = model(input_values, attention_mask)
             pred_ids = model.generate(encoded, max_length=config.max_text_len,lead_logits = lead_logits)
 
             
@@ -574,7 +573,7 @@ def validate(model, tokenizer, val_loader, epoch):
                 pred_texts.append(text)
             
             # 计算指标
-            print(texts[0],"val0",pred_texts[0])
+            # print(texts[0],"val0",pred_texts[0])
             for i in range(len(texts)):
                 ref = texts[i]
                 hyp = pred_texts[i]
@@ -605,8 +604,8 @@ def test(model, tokenizer, test_loader):
             texts = batch["text"]
             
             # 生成预测
-            encoded, _ = model(input_values, attention_mask)
-            pred_ids = model.generate(encoded, max_length=config.max_text_len)
+            encoded, _ ,lead_logits= model(input_values, attention_mask)
+            pred_ids = model.generate(encoded, max_length=config.max_text_len,lead_logits = lead_logits)
             
             # 解码预测
             pred_texts = []
@@ -615,7 +614,7 @@ def test(model, tokenizer, test_loader):
                 pred_texts.append(text)
             
             # 保存结果
-            print(texts[0],"test",pred_texts[0])
+            # print(texts[0],"test",pred_texts[0])
             for i in range(len(texts)):
                 ref = texts[i]
                 hyp = pred_texts[i]
