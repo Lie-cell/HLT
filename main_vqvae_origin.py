@@ -32,7 +32,7 @@ class Config:
     # 训练参数
     batch_size = 16
     num_workers = 8
-    lr = 1e-4
+    lr = 1e-5
     epochs = 16
     save_dir = "model"
     report_dir = "report"
@@ -40,6 +40,9 @@ class Config:
     
     # 验证集划分
     val_ratio = 0.1
+    qwen_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"  # API端点
+    rescoring_topk = 5  # 重打分候选数量
+    semantic_correction = True  # 是否启用语义纠错
 
 config = Config()
 os.makedirs(config.save_dir, exist_ok=True)
@@ -206,11 +209,85 @@ class VectorQuantizerEMA(nn.Module):
         
         return quantized, loss, encoding_indices
 
+import requests
+class QwenAPI:
+    def __init__(self, api_key = "sk-950071b47e48467e95f95d84383513dd", base_url = config.qwen_base_url):
+        if 'DASHSCOPE_API_KEY' in os.environ:
+            self.api_key = os.environ['DASHSCOPE_API_KEY']
+        else:
+            self.api_key = api_key
+        self.base_url = base_url
+        
+    def semantic_correction(self, text):
+        """ 语义纠错（如：'我优不知道'->'我也不知道'） """
+        payload = {
+            "model": "qwen-turbo",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是一个中文语义纠错专家，严格遵循以下规则："
+                               "1. 只修改语义错误的词，保持原句结构"
+                               "2. 不添加或删除句子内容"
+                               "3. 输出格式：{\"corrected_text\": \"修正后文本\"}"
+                },
+                {
+                    "role": "user",
+                    "content": f"请纠正语义错误：'{text}'"
+                }
+            ]
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        try:
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=5
+            )
+            result = response.json()
+            return result['choices'][0]['message']['content']
+        except Exception as e:
+            print(f"API Error: {e}")
+            return text  # 失败时返回原文
+    
+    def rescoring(self, candidates):
+        """ 重打分排序（选择最合理的候选） """
+        prompt = "评估下列语音识别候选结果的合理性，返回最自然的选项（只输出序号）：\n"
+        for i, cand in enumerate(candidates):
+            prompt += f"{i+1}. {cand}\n"
+        
+        payload = {
+            "model": "qwen-max",
+            "messages": [
+                {"role": "system", "content": "你是一个语音识别质量评估专家"},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.1
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        
+        try:
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=5
+            )
+            choice = int(response.json()['choices'][0]['message']['content'])
+            return candidates[choice-1]
+        except Exception as e:
+            print(f"错误: {e}")
+            return candidates[0]  # 失败时返回原始最佳结果
+
 # 端到端模型
 class VQVAEASR(nn.Module):
-    def __init__(self, hubert_model, vq_codebook_size, embedding_dim, vocab_size):
+    def __init__(self, hubert_model, vq_codebook_size, embedding_dim, vocab_size , tokenizer):
         super().__init__()
         # HuBERT特征提取器
+        self.tokenizer = tokenizer
         self.hubert = hubert_model
         for param in self.hubert.parameters():
             param.requires_grad = False
@@ -250,7 +327,7 @@ class VQVAEASR(nn.Module):
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
         self.fc_out = nn.Linear(embedding_dim, vocab_size)
         self.vocab_size = vocab_size
-    
+        self.embedding_layer = nn.Embedding(config.vq_codebook_size, config.embedding_dim).to(config.device)
     def forward(self, input_values, attention_mask, labels=None):
         # 提取HuBERT特征
         with torch.no_grad():
@@ -261,10 +338,10 @@ class VQVAEASR(nn.Module):
         batch_size, seq_len, feat_dim = features.shape
         features = features.reshape(-1, feat_dim)  # 使用reshape代替view
         quantized, vq_loss, encoded = self.vq(features)
-        embedding_layer = nn.Embedding(config.vq_codebook_size, config.embedding_dim).to(config.device)
-        encodeed_indices = embedding_layer(encoded)
+        # embedding_layer = nn.Embedding(config.vq_codebook_size, config.embedding_dim).to(config.device)
+        encodeed_indices = self.embedding_layer(encoded)
         encodeed_indices = encodeed_indices.reshape(batch_size, seq_len, feat_dim)
-        # quantized = quantized.reshape(batch_size, seq_len, feat_dim)  # 使用reshape代替view
+        quantized = quantized.reshape(batch_size, seq_len, feat_dim)  # 使用reshape代替view
         
         # 编码器处理
         encoded = self.encoder(encodeed_indices)
@@ -323,10 +400,71 @@ class VQVAEASR(nn.Module):
             generated = torch.cat([generated, next_token], dim=1)
             
             # 如果生成了EOS token，停止生成
-            if (next_token == 2).all():  # 假设2是EOS token
+            if (next_token == 2).all():  # 2是EOS token
                 break
         
         return generated
+    
+    def generate_topk(self, encoded, max_length=100, beam_size=config.rescoring_topk, temperature=1.0 ):
+        """
+        使用 Beam Search 生成 Top-K 个候选序列
+        :param encoded: 编码器输出 [batch_size, seq_len, embedding_dim]
+        :param max_length: 最大生成长度
+        :param beam_size: 返回的候选数量
+        :param temperature: 温度控制多样性
+        :return: 一个 batch 中每个样本的 top-k 候选列表
+        """
+        self.eval()
+        batch_size = encoded.size(0)
+        device = encoded.device
+
+        results = []
+
+        for b in range(batch_size):
+            memory = encoded[b:b+1]  # [1, seq_len, embed]
+            seq_len = memory.size(1)
+
+            # 初始候选：[(token_ids, log_prob)]
+            candidates = [([1], 0.0)]  # 初始为 <sos>
+
+            for step in range(max_length):
+                new_candidates = []
+                for tokens, score in candidates:
+                    if tokens[-1] == 2:  # EOS
+                        new_candidates.append((tokens, score))
+                        continue
+
+                    # 构造输入
+                    input_ids = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+                    input_emb = self.embedding(input_ids)
+
+                    # 解码器前向
+                    output = self.decoder(tgt=input_emb, memory=memory)
+                    # print(output.shape)
+                    logits = self.fc_out(output[:, -1, :]) / temperature
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    # print(log_probs.shape)
+
+                    # 取 top beam_size 个
+                    top_log_probs, top_indices = torch.topk(log_probs, beam_size)
+                    for i in range(beam_size):
+                        new_tokens = tokens + [top_indices[0, i].item()]
+                        new_score = score + top_log_probs[0, i].item()
+                        new_candidates.append((new_tokens, new_score))
+
+                # 保留 top beam_size 个候选
+                new_candidates.sort(key=lambda x: x[1], reverse=True)
+                candidates = new_candidates[:beam_size]
+
+                # 所有候选都结束
+                if all(cand[0][-1] == 2 for cand in candidates):
+                    break
+            # print(candidates)
+            # 解码为文本
+            decoded_candidates = [self.tokenizer.decode(tokens) for tokens, _ in candidates]
+            results.append(decoded_candidates)
+
+        return results
 
 # 训练函数
 from tqdm import tqdm
@@ -471,22 +609,22 @@ def validate(model, tokenizer, val_loader, epoch):
             labels = labels.to(config.device)
             
             # # 计算损失
-            # outputs, vq_loss, targets = model(
-            #     input_values=input_values,
-            #     attention_mask=attention_mask,
-            #     labels=labels
-            # )
+            outputs, vq_loss, targets = model(
+                input_values=input_values,
+                attention_mask=attention_mask,
+                labels=labels
+            )
             
-            # outputs = outputs.reshape(-1, outputs.size(-1))  # 使用reshape代替view
-            # targets = targets.reshape(-1)  # 使用reshape代替view
+            outputs = outputs.reshape(-1, outputs.size(-1))  # 使用reshape代替view
+            targets = targets.reshape(-1)  # 使用reshape代替view
             
-            # # 忽略pad token的损失
-            # loss_mask = targets != tokenizer.pad_token_id
-            # outputs = outputs[loss_mask]
-            # targets = targets[loss_mask]
+            # 忽略pad token的损失
+            loss_mask = targets != tokenizer.pad_token_id
+            outputs = outputs[loss_mask]
+            targets = targets[loss_mask]
             
-            # asr_loss = F.cross_entropy(outputs, targets, ignore_index=tokenizer.pad_token_id)
-            # total_loss += (0.5*asr_loss + 0.5*vq_loss).item()
+            asr_loss = F.cross_entropy(outputs, targets, ignore_index=tokenizer.pad_token_id)
+            total_loss += (0.5*asr_loss + 0.5*vq_loss).item()
             
             # 生成预测
             encoded, _ = model(input_values, attention_mask)
@@ -522,7 +660,9 @@ def test(model, tokenizer, test_loader):
     total_cer = 0
     count = 0
     results = []
-    
+
+    qwen = QwenAPI(base_url = config.qwen_base_url)
+
     with torch.no_grad():
         for batch in test_loader:
             input_values = batch["input_values"].to(config.device)
@@ -531,21 +671,41 @@ def test(model, tokenizer, test_loader):
             
             # 生成预测
             encoded, _ = model(input_values, attention_mask)
-            pred_ids = model.generate(encoded, max_length=config.max_text_len)
+            # print(encoded)
+            pred_texts = model.generate_topk(encoded, max_length=config.max_text_len)
             
             # 解码预测
-            pred_texts = []
-            for ids in pred_ids:
-                text = tokenizer.decode(ids.tolist())
-                pred_texts.append(text)
-            
+
+            final_preds = []
+            for i in range(len(pred_texts)):
+                candidates = pred_texts[i]
+                print(candidates )
+                best_candidate = qwen.rescoring(candidates)
+                final_preds.append(best_candidate)
+            # print(final_preds)
+            if config.semantic_correction:
+                corrected_texts = []
+                for text in final_preds:
+                    corrected = qwen.semantic_correction(text)
+                    # 解析API返回的JSON格式
+                    print(corrected)
+                    if corrected.startswith('{'):
+                        try:
+                            corrected = json.loads(corrected)['corrected_text']
+                        except Exception as e:
+                            print(e)
+                            pass
+                    corrected_texts.append(corrected)
+                pred_texts = corrected_texts
+
             # 保存结果
             print(texts[0],"test",pred_texts[0])
             for i in range(len(texts)):
                 ref = texts[i]
                 hyp = pred_texts[i]
+                orig_pred = final_preds[i]
                 
-                results.append(f"Reference: {ref}\nPredicted: {hyp}\n\n")
+                results.append(f"Reference: {ref}\nCorrected_predicted: {hyp}\nOrigin_predicted: {orig_pred}\n\n")
                 
                 if ref and hyp:
                     # CER：字符错误率
@@ -583,7 +743,11 @@ def main():
     
     # 重新加载完整训练数据集
     train_dataset = AISHELLDataset(config.train_dir, config.transcript_path)
-
+    # val_size1 = int(len(train_dataset) * 0.99)
+    # train_size1 = len(train_dataset) - val_size1
+    # train_dataset, _ = random_split(
+    #     train_dataset, [train_size1, val_size1]
+    # )
     # 划分训练集和验证集
     val_size = int(len(train_dataset) * config.val_ratio)
     train_size = len(train_dataset) - val_size
@@ -626,7 +790,8 @@ def main():
         hubert_model=hubert_model,
         vq_codebook_size=config.vq_codebook_size,
         embedding_dim=config.embedding_dim,
-        vocab_size=tokenizer.vocab_size
+        vocab_size=tokenizer.vocab_size,
+        tokenizer=tokenizer
     )
     model.to(config.device)
     

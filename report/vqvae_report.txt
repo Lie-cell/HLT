@@ -1,9 +1,10 @@
 VQVAE ASR Training Report
-Start Time: Fri Jul 11 14:27:13 2025
+Start Time: Sat Jul 12 16:54:23 2025
 Device: cuda
 Batch Size: 16
-Learning Rate: 0.0001
+Learning Rate: 1e-05
 Epochs: 16
 Vocab Size: 4234
 
 Epoch	Train Loss	Val Loss	Val CER	Time
+1	0.2836	2.3562	0.9731	4077.4s

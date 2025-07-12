@@ -625,11 +625,11 @@ def main():
     
     # 训练或加载K-means量化器
     quantizer = KMeansQuantizer(n_clusters=config.kmeans_n_clusters)
-    # val_size1 = int(len(train_dataset) * 0.75)
-    # train_size1 = len(train_dataset) - val_size1
-    # train_dataset, _ = random_split(
-    #     train_dataset, [train_size1, val_size1]
-    # )
+    val_size1 = int(len(train_dataset) * 0.75)
+    train_size1 = len(train_dataset) - val_size1
+    train_dataset, _ = random_split(
+        train_dataset, [train_size1, val_size1]
+    )
     if os.path.exists(config.kmeans_model_path):
         quantizer.load(config.kmeans_model_path)
     else:
@@ -639,7 +639,7 @@ def main():
         quantizer.save(config.kmeans_model_path)
     
     # 重新加载完整训练数据集
-    train_dataset = AISHELLDataset(config.train_dir, config.transcript_path)
+    # train_dataset = AISHELLDataset(config.train_dir, config.transcript_path)
     # 划分训练集和验证集
     val_size = int(len(train_dataset) * config.val_ratio)
     train_size = len(train_dataset) - val_size
