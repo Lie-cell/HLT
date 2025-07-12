@@ -149,17 +149,23 @@ class AISHELLDataset(Dataset):
         }
 
 # 向量量化层
-class VectorQuantizer(nn.Module):
-    def __init__(self, codebook_size, embedding_dim, commitment_cost=0.25):
+class VectorQuantizerEMA(nn.Module):
+    def __init__(self, codebook_size, embedding_dim, commitment_cost=0.25, decay=0.99, epsilon=1e-5):
         super().__init__()
         self.codebook_size = codebook_size
         self.embedding_dim = embedding_dim
         self.commitment_cost = commitment_cost
+        self.decay = decay
+        self.epsilon = epsilon
         
         # 初始化码本
         self.codebook = nn.Embedding(codebook_size, embedding_dim)
-        self.codebook.weight.data.uniform_(-1/codebook_size, 1/codebook_size)
-    
+        self.codebook.weight.data.normal_()
+        
+        # EMA统计量
+        self.register_buffer('_ema_cluster_size', torch.zeros(codebook_size))
+        self.register_buffer('_ema_w', self.codebook.weight.data.clone())
+
     def forward(self, inputs):
         # 计算输入与码本的距离
         distances = (torch.sum(inputs**2, dim=1, keepdim=True) 
@@ -167,22 +173,38 @@ class VectorQuantizer(nn.Module):
                     - 2 * torch.matmul(inputs, self.codebook.weight.t()))
         
         # 获取最近邻编码
-        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
-        encodings = torch.zeros(encoding_indices.shape[0], self.codebook_size, device=inputs.device)
-        encodings.scatter_(1, encoding_indices, 1)
+        encoding_indices = torch.argmin(distances, dim=1)
+        encodings = F.one_hot(encoding_indices, self.codebook_size).float()
         
         # 量化向量
         quantized = torch.matmul(encodings, self.codebook.weight)
         
-        # 计算损失
-        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
-        q_latent_loss = F.mse_loss(quantized, inputs.detach())
-        loss = q_latent_loss + self.commitment_cost * e_latent_loss
+        # EMA更新码本
+        if self.training:
+            # 更新EMA统计量
+            self._ema_cluster_size = (self.decay * self._ema_cluster_size 
+                                     + (1 - self.decay) * encodings.sum(0))
+            
+            # 拉普拉斯平滑防止码本坍塌
+            n = self._ema_cluster_size.sum()
+            smoothed_size = ((self._ema_cluster_size + self.epsilon)
+                           / (n + self.codebook_size * self.epsilon) * n)
+            
+            # 更新权重和
+            dw = torch.matmul(encodings.t(), inputs)
+            self._ema_w = self.decay * self._ema_w + (1 - self.decay) * dw
+            
+            # 应用平滑后的码本
+            self.codebook.weight.data = self._ema_w / smoothed_size.unsqueeze(1)
         
         # 直通估计器
         quantized = inputs + (quantized - inputs).detach()
         
-        return quantized, loss, encoding_indices.squeeze()
+        # 计算commitment损失
+        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
+        loss = self.commitment_cost * e_latent_loss
+        
+        return quantized, loss, encoding_indices
 
 # 端到端模型
 class VQVAEASR(nn.Module):
@@ -194,7 +216,12 @@ class VQVAEASR(nn.Module):
             param.requires_grad = False
         
         # VQ层
-        self.vq = VectorQuantizer(vq_codebook_size, embedding_dim)
+        self.vq = VectorQuantizerEMA(
+            codebook_size=vq_codebook_size,
+            embedding_dim=embedding_dim,
+            commitment_cost=0.25,
+            decay=0.99
+        )
         
         # Transformer编码器-解码器
         self.encoder = nn.TransformerEncoder(
@@ -443,23 +470,23 @@ def validate(model, tokenizer, val_loader, epoch):
             labels, _ = tokenizer.batch_encode(texts)
             labels = labels.to(config.device)
             
-            # 计算损失
-            outputs, vq_loss, targets = model(
-                input_values=input_values,
-                attention_mask=attention_mask,
-                labels=labels
-            )
+            # # 计算损失
+            # outputs, vq_loss, targets = model(
+            #     input_values=input_values,
+            #     attention_mask=attention_mask,
+            #     labels=labels
+            # )
             
-            outputs = outputs.reshape(-1, outputs.size(-1))  # 使用reshape代替view
-            targets = targets.reshape(-1)  # 使用reshape代替view
+            # outputs = outputs.reshape(-1, outputs.size(-1))  # 使用reshape代替view
+            # targets = targets.reshape(-1)  # 使用reshape代替view
             
-            # 忽略pad token的损失
-            loss_mask = targets != tokenizer.pad_token_id
-            outputs = outputs[loss_mask]
-            targets = targets[loss_mask]
+            # # 忽略pad token的损失
+            # loss_mask = targets != tokenizer.pad_token_id
+            # outputs = outputs[loss_mask]
+            # targets = targets[loss_mask]
             
-            asr_loss = F.cross_entropy(outputs, targets, ignore_index=tokenizer.pad_token_id)
-            total_loss += (0.5*asr_loss + 0.5*vq_loss).item()
+            # asr_loss = F.cross_entropy(outputs, targets, ignore_index=tokenizer.pad_token_id)
+            # total_loss += (0.5*asr_loss + 0.5*vq_loss).item()
             
             # 生成预测
             encoded, _ = model(input_values, attention_mask)

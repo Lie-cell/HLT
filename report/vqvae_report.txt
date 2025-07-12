@@ -1,5 +1,5 @@
 VQVAE ASR Training Report
-Start Time: Thu Jul 10 09:47:46 2025
+Start Time: Fri Jul 11 14:27:13 2025
 Device: cuda
 Batch Size: 16
 Learning Rate: 0.0001
