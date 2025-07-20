@@ -6,4 +6,7 @@ model-pre/hubert-base/pytorch_model.bin
 model-pre/wav2vec-base/pytorch_model.bin
 model-pre/wav2vec-base/chinese-wav2vec2-base-fairseq-ckpt.pt
 2025年南开大学HLT实验室语音信息处理方向推免研究生夏令营科研题目.pdf
-model
+model/vqvae_asr_model.pt
+1508.04395v2.pdf
+基于离散单元的汉语语音识别系统研究.pptx
+model/kmeans_ctc_asr_model.pt

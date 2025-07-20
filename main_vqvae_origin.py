@@ -13,6 +13,7 @@ import re
 from collections import Counter
 from tqdm import tqdm
 import jiwer
+from torch.nn.utils.rnn import pad_sequence
 
 # 配置参数
 class Config:
@@ -26,29 +27,29 @@ class Config:
     hubert_model_path = "model-pre/hubert-base"
     vq_codebook_size = 512
     embedding_dim = 768
-    max_audio_len = 96000  # 6s for 16kHz
+    max_audio_len = 96000  # 7s for 16kHz
     max_text_len = 50
     
     # 训练参数
     batch_size = 16
     num_workers = 8
     lr = 1e-5
-    epochs = 16
+    epochs = 50
     save_dir = "model"
     report_dir = "report"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # 验证集划分
     val_ratio = 0.1
-    qwen_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"  # API端点
+    qwen_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"  
     rescoring_topk = 5  # 重打分候选数量
-    semantic_correction = True  # 是否启用语义纠错
+    semantic_correction = False  # 是否启用语义纠错
 
 config = Config()
 os.makedirs(config.save_dir, exist_ok=True)
 os.makedirs(config.report_dir, exist_ok=True)
 
-# 自定义字符级分词器
+# 分词器
 class CharTokenizer:
     def __init__(self, texts):
         # 构建字符词汇表
@@ -99,7 +100,6 @@ class AISHELLDataset(Dataset):
     def __init__(self, audio_dir, transcript_path, max_audio_len=160000):
         self.audio_dir = audio_dir
         
-        # 加载转录本
         with open(transcript_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
@@ -130,24 +130,30 @@ class AISHELLDataset(Dataset):
         audio_path, text = self.data[idx]
         
         # 加载音频
+        
         waveform, sr = torchaudio.load(audio_path)
         waveform = waveform.squeeze()
-        
+        orig_len = len(waveform)
+    
+        # 创建初始mask（全1）
+        attention_mask = torch.ones(orig_len)
         # 确保采样率正确
         if sr != 16000:
-            resampler = torchaudio.transforms.Resample(sr, 16000)
+            resampler = T.Resample(sr, 16000)
             waveform = resampler(waveform)
         
         # 截取或填充音频
         if len(waveform) > config.max_audio_len:
             waveform = waveform[:config.max_audio_len]
+            attention_mask = attention_mask[:config.max_audio_len]
         elif len(waveform) < config.max_audio_len:
             pad_len = config.max_audio_len - len(waveform)
-            waveform = torch.nn.functional.pad(waveform, (0, pad_len))
+            waveform = F.pad(waveform, (0, pad_len))
+            attention_mask = F.pad(attention_mask, (0, pad_len))  # 填充部分设为0
         
         return {
             "input_values": waveform,
-            "attention_mask": torch.ones_like(waveform),
+            "attention_mask": attention_mask,
             "text": text
         }
 
@@ -211,7 +217,7 @@ class VectorQuantizerEMA(nn.Module):
 
 import requests
 class QwenAPI:
-    def __init__(self, api_key = "sk-950071b47e48467e95f95d84383513dd", base_url = config.qwen_base_url):
+    def __init__(self, api_key = None, base_url = config.qwen_base_url):
         if 'DASHSCOPE_API_KEY' in os.environ:
             self.api_key = os.environ['DASHSCOPE_API_KEY']
         else:
@@ -274,7 +280,7 @@ class QwenAPI:
                 f"{self.base_url}/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=5
+                timeout=3
             )
             choice = int(response.json()['choices'][0]['message']['content'])
             return candidates[choice-1]
@@ -291,6 +297,11 @@ class VQVAEASR(nn.Module):
         self.hubert = hubert_model
         for param in self.hubert.parameters():
             param.requires_grad = False
+        # for name, param in self.hubert.named_parameters():
+        #     if 'feature_extractor' in name or 'feature_projection' in name: 
+        #         param.requires_grad = False
+        #     else:  
+        #         param.requires_grad = True # 解冻，未启用
         
         # VQ层
         self.vq = VectorQuantizerEMA(
@@ -301,22 +312,51 @@ class VQVAEASR(nn.Module):
         )
         
         # Transformer编码器-解码器
-        self.encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=embedding_dim,
-                nhead=8,
-                dim_feedforward=1536,
-                dropout=0.1,
-                batch_first=True
+        self.encoder = nn.ModuleList([
+            nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=embedding_dim,
+                    nhead=8,
+                    dim_feedforward=2048,
+                    dropout=0.1,
+                    batch_first=True
+                ),
+                num_layers=2
             ),
-            num_layers=4
+            nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=embedding_dim,
+                    nhead=8,
+                    dim_feedforward=2048,
+                    dropout=0.1,
+                    batch_first=True
+                ),
+                num_layers=2
+            ),
+            nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=embedding_dim,
+                    nhead=8,
+                    dim_feedforward=2048,
+                    dropout=0.1,
+                    batch_first=True
+                ),
+                num_layers=2
+            )
+        ])
+        
+        # 卷积特征适配器
+        self.conv_adapter = nn.Sequential(
+            nn.Conv1d(embedding_dim, embedding_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.BatchNorm1d(embedding_dim)
         )
         
         self.decoder = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
                 d_model=embedding_dim,
                 nhead=8,
-                dim_feedforward=1536,
+                dim_feedforward=2048,
                 dropout=0.1,
                 batch_first=True
             ),
@@ -328,23 +368,65 @@ class VQVAEASR(nn.Module):
         self.fc_out = nn.Linear(embedding_dim, vocab_size)
         self.vocab_size = vocab_size
         self.embedding_layer = nn.Embedding(config.vq_codebook_size, config.embedding_dim).to(config.device)
+
     def forward(self, input_values, attention_mask, labels=None):
         # 提取HuBERT特征
         with torch.no_grad():
             outputs = self.hubert(input_values, attention_mask=attention_mask)
             features = outputs.last_hidden_state
-        
-        # VQ量化
+
         batch_size, seq_len, feat_dim = features.shape
-        features = features.reshape(-1, feat_dim)  # 使用reshape代替view
-        quantized, vq_loss, encoded = self.vq(features)
+        mask_ratio = input_values.shape[1] / features.shape[1]  
+        mask_downsample = F.avg_pool1d(
+            attention_mask.float().unsqueeze(1), 
+            kernel_size=int(mask_ratio), 
+            stride=int(mask_ratio)
+        ).squeeze(1) > 0.05 
+        # 仅保留有效特征 
+        valid_features = []
+        valid_lengths = []
+        valid_indices = [] 
+        for i in range(features.size(0)):
+            valid_idx = torch.where(mask_downsample[i])[0] 
+            valid_indices.append(valid_idx)
+            valid_features.append(features[i, valid_idx])
+            valid_lengths.append(len(valid_idx))
+        
+        # 填充
+        features_padded = pad_sequence(valid_features, batch_first=True)
+        # 量化仅作用于有效特征
+        valid_feat_list = []
+        for i in range(features_padded.size(0)):
+            valid_len = valid_lengths[i]
+            valid_feat = features_padded[i, :valid_len, :] 
+            valid_feat_list.append(valid_feat) 
+        
+        valid_feat_flat = torch.cat(valid_feat_list, dim=0).to(config.device)
+        # VQ量化
+        # batch_size, seq_len, feat_dim = features.shape
+        # features = features.reshape(-1, feat_dim)  # 使用reshape代替view
+        quantized, vq_loss, encoded = self.vq(valid_feat_flat)
         # embedding_layer = nn.Embedding(config.vq_codebook_size, config.embedding_dim).to(config.device)
         encodeed_indices = self.embedding_layer(encoded)
-        encodeed_indices = encodeed_indices.reshape(batch_size, seq_len, feat_dim)
-        quantized = quantized.reshape(batch_size, seq_len, feat_dim)  # 使用reshape代替view
+        B, L, D = features.shape
+        quantized_restored = torch.zeros(B, L, D, device=features.device)
+
+        # 把量化结果按索引填回去
+        start = 0
+        for i, idx in enumerate(valid_indices):
+            end = start + len(idx)
+            quantized_restored[i, idx] = encodeed_indices[start:end]
+            start = end
+        # encodeed_indices = encodeed_indices.reshape(batch_size, seq_len, feat_dim)
+        # quantized = quantized.reshape(batch_size, seq_len, feat_dim)  # 使用reshape代替view
         
         # 编码器处理
-        encoded = self.encoder(encodeed_indices)
+        x = self.conv_adapter(quantized_restored.permute(0, 2, 1)).permute(0, 2, 1)
+        stage1_out = self.encoder[0](x, src_key_padding_mask=~mask_downsample.bool())
+        stage2_out = self.encoder[1](stage1_out, src_key_padding_mask=~mask_downsample.bool())
+        stage3_out = self.encoder[2](stage2_out, src_key_padding_mask=~mask_downsample.bool())
+        encoded = stage1_out + stage2_out + stage3_out
+        # encoded = self.encoder(quantized_restored,src_key_padding_mask=~mask_downsample.bool())
         
         # 解码器处理
         if labels is not None:
@@ -358,7 +440,7 @@ class VQVAEASR(nn.Module):
             # 创建掩码
             tgt_mask = torch.triu(torch.ones(decoder_input.size(1), decoder_input.size(1)), 
                                  diagonal=1).bool().to(config.device)
-            tgt_key_padding_mask = (target == 0)  # 假设0是pad token
+            tgt_key_padding_mask = (target == 0)  # 0是pad token
             
             # 解码器前向传播
             decoder_output = self.decoder(
@@ -375,11 +457,12 @@ class VQVAEASR(nn.Module):
             # 推理模式
             return encoded, vq_loss
     
+    # 仅valid使用
     def generate(self, encoded, max_length=100, temperature=1.0):
         """自回归生成文本"""
         batch_size = encoded.size(0)
         # 初始化为SOS token
-        generated = torch.ones(batch_size, 1, dtype=torch.long, device=config.device) * 1  # 假设1是SOS token
+        generated = torch.ones(batch_size, 1, dtype=torch.long, device=config.device) * 1  # 1是SOS token
         
         for i in range(max_length):
             # 嵌入
@@ -421,7 +504,7 @@ class VQVAEASR(nn.Module):
         results = []
 
         for b in range(batch_size):
-            memory = encoded[b:b+1]  # [1, seq_len, embed]
+            memory = encoded[b:b+1]  
             seq_len = memory.size(1)
 
             # 初始候选：[(token_ids, log_prob)]
@@ -434,11 +517,9 @@ class VQVAEASR(nn.Module):
                         new_candidates.append((tokens, score))
                         continue
 
-                    # 构造输入
                     input_ids = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
                     input_emb = self.embedding(input_ids)
 
-                    # 解码器前向
                     output = self.decoder(tgt=input_emb, memory=memory)
                     # print(output.shape)
                     logits = self.fc_out(output[:, -1, :]) / temperature
@@ -474,14 +555,14 @@ def calculate_weights(e, E):
     second_stage_end = E * 10 // 16  # 6/16 + 4/16 = 10/16
 
     if e <= first_stage_end:
-        # 第一阶段：从 0.95 线性衰减到 0.5
-        vq_weight = 0.95 - 0.45 * (e - 1) / (first_stage_end - 1)
+        # 第一阶段：从 0.9 线性衰减到 0.5
+        vq_weight = 0.9 - 0.4 * (e - 1) / (first_stage_end - 1)
     elif e <= second_stage_end:
         # 第二阶段：保持 0.5
         vq_weight = 0.5
     else:
-        # 第三阶段：从 0.5 线性衰减到 0.05
-        vq_weight = 0.5 - 0.45 * (e - second_stage_end) / (E - second_stage_end)
+        # 第三阶段：从 0.5 线性衰减到 0.1
+        vq_weight = 0.5 - 0.4 * (e - second_stage_end) / (E - second_stage_end)
     
     asr_weight = 1 - vq_weight
     return vq_weight, asr_weight
@@ -533,8 +614,8 @@ def train(model, tokenizer, train_loader, val_loader, optimizer, scheduler):
             )
             
             # 计算ASR损失
-            outputs = outputs.reshape(-1, outputs.size(-1))  # 使用reshape代替view
-            targets = targets.reshape(-1)  # 使用reshape代替view
+            outputs = outputs.reshape(-1, outputs.size(-1))  
+            targets = targets.reshape(-1)  
             
             # 忽略pad token的损失
             loss_mask = targets != tokenizer.pad_token_id
@@ -608,15 +689,14 @@ def validate(model, tokenizer, val_loader, epoch):
             labels, _ = tokenizer.batch_encode(texts)
             labels = labels.to(config.device)
             
-            # # 计算损失
             outputs, vq_loss, targets = model(
                 input_values=input_values,
                 attention_mask=attention_mask,
                 labels=labels
             )
             
-            outputs = outputs.reshape(-1, outputs.size(-1))  # 使用reshape代替view
-            targets = targets.reshape(-1)  # 使用reshape代替view
+            outputs = outputs.reshape(-1, outputs.size(-1)) 
+            targets = targets.reshape(-1)  
             
             # 忽略pad token的损失
             loss_mask = targets != tokenizer.pad_token_id
@@ -675,11 +755,14 @@ def test(model, tokenizer, test_loader):
             pred_texts = model.generate_topk(encoded, max_length=config.max_text_len)
             
             # 解码预测
+            # pred_texts = []
+            # for ids in pred_ids:
+            #     text = tokenizer.decode(ids.tolist())
+            #     pred_texts.append(text)
 
             final_preds = []
             for i in range(len(pred_texts)):
                 candidates = pred_texts[i]
-                print(candidates )
                 best_candidate = qwen.rescoring(candidates)
                 final_preds.append(best_candidate)
             # print(final_preds)
@@ -688,7 +771,6 @@ def test(model, tokenizer, test_loader):
                 for text in final_preds:
                     corrected = qwen.semantic_correction(text)
                     # 解析API返回的JSON格式
-                    print(corrected)
                     if corrected.startswith('{'):
                         try:
                             corrected = json.loads(corrected)['corrected_text']
@@ -697,8 +779,10 @@ def test(model, tokenizer, test_loader):
                             pass
                     corrected_texts.append(corrected)
                 pred_texts = corrected_texts
+            else :
+                pred_texts = final_preds
 
-            # 保存结果
+            # # 保存结果
             print(texts[0],"test",pred_texts[0])
             for i in range(len(texts)):
                 ref = texts[i]
@@ -706,7 +790,6 @@ def test(model, tokenizer, test_loader):
                 orig_pred = final_preds[i]
                 
                 results.append(f"Reference: {ref}\nCorrected_predicted: {hyp}\nOrigin_predicted: {orig_pred}\n\n")
-                
                 if ref and hyp:
                     # CER：字符错误率
                     # print(ref,"123",hyp)
@@ -734,14 +817,13 @@ def test(model, tokenizer, test_loader):
 
 # 主函数
 def main():
-    # 加载数据集（首先加载训练数据用于构建词汇表）
+    # 加载训练数据用于构建词汇表
     train_dataset = AISHELLDataset(config.train_dir, config.transcript_path)
     
     # 初始化分词器
     tokenizer = CharTokenizer(train_dataset.texts)
     print(f"Built tokenizer with vocab size: {tokenizer.vocab_size}")
     
-    # 重新加载完整训练数据集
     train_dataset = AISHELLDataset(config.train_dir, config.transcript_path)
     # val_size1 = int(len(train_dataset) * 0.99)
     # train_size1 = len(train_dataset) - val_size1
@@ -796,11 +878,11 @@ def main():
     model.to(config.device)
     
     # 优化器和学习率调度器
-    optimizer = optim.Adam(model.parameters(), lr=config.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=config.lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2, verbose=True
+        optimizer, mode='min', factor=0.5, patience=2
     )
-    # val_loss, val_cer, val_wer = validate(model, tokenizer, val_loader ,10)
+    
     # 训练模型
     model = train(model, tokenizer, train_loader, val_loader, optimizer, scheduler)
     # checkpoint = torch.load(os.path.join(config.save_dir, "vqvae_asr_model.pt"), map_location=config.device)

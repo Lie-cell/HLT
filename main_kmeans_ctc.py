@@ -14,6 +14,7 @@ from collections import Counter
 from tqdm import tqdm
 import jiwer
 from sklearn.cluster import KMeans
+from sklearn.cluster import MiniBatchKMeans
 import joblib
 import torchaudio.transforms as T
 from torch.nn.utils.rnn import pad_sequence
@@ -31,16 +32,16 @@ class Config:
     
     # 模型参数
     hubert_model_path = "model-pre/hubert-base"
-    kmeans_n_clusters = 512  # K-means聚类中心数
+    kmeans_n_clusters = 1024  # K-means聚类中心数
     embedding_dim = 768
     max_audio_len = 96000  # 6s for 16kHz
     max_text_len = 50
     
     # 训练参数
-    batch_size = 16
+    batch_size = 32
     num_workers = 8
     lr = 1e-5
-    epochs = 16
+    epochs = 50
     save_dir = "model"
     report_dir = "report"
     kmeans_model_path = "model/kmeans_model.pkl"
@@ -51,23 +52,21 @@ class Config:
     
     # CTC参数
     blank_token = 0  # CTC空白符
-    beam_width = 50  # Beam search宽度
-    lm_path = None  # 语言模型路径（可选）
+    beam_width = 5  # Beam search宽度
 
 config = Config()
 os.makedirs(config.save_dir, exist_ok=True)
 os.makedirs(config.report_dir, exist_ok=True)
 
-# 自定义字符级分词器（针对CTC优化）
 class CTCTokenizer:
     def __init__(self, texts):
-        # 构建字符词汇表，特别处理空白符
+        # 构建字符词汇表
         all_chars = ''.join(texts)
         char_counter = Counter(all_chars)
         
         # 排序并创建词汇表
         chars = sorted(char_counter.keys())
-        self.vocab = {'<blank>': 0, '<unk>': 1}  # CTC专用词汇表
+        self.vocab = {'<blank>': 0, '<unk>': 1}  # 词汇表
         self.vocab.update({char: idx+2 for idx, char in enumerate(chars)})
         
         self.inv_vocab = {v: k for k, v in self.vocab.items()}
@@ -135,9 +134,13 @@ class AISHELLDataset(Dataset):
         audio_path, text = self.data[idx]
         
         # 加载音频
+        
         waveform, sr = torchaudio.load(audio_path)
         waveform = waveform.squeeze()
-        
+        orig_len = len(waveform)
+    
+        # 创建初始mask（全1）
+        attention_mask = torch.ones(orig_len)
         # 确保采样率正确
         if sr != 16000:
             resampler = T.Resample(sr, 16000)
@@ -146,35 +149,144 @@ class AISHELLDataset(Dataset):
         # 截取或填充音频
         if len(waveform) > config.max_audio_len:
             waveform = waveform[:config.max_audio_len]
+            attention_mask = attention_mask[:config.max_audio_len]
         elif len(waveform) < config.max_audio_len:
             pad_len = config.max_audio_len - len(waveform)
             waveform = F.pad(waveform, (0, pad_len))
+            attention_mask = F.pad(attention_mask, (0, pad_len))  # 填充部分设为0
         
         return {
             "input_values": waveform,
-            "attention_mask": torch.ones_like(waveform),
+            "attention_mask": attention_mask,
             "text": text
         }
 
 # K-means特征量化器
 class KMeansQuantizer:
-    def __init__(self, n_clusters=512):
+    def __init__(self, n_clusters=512 ,batch_size=10000):
         self.n_clusters = n_clusters
         self.kmeans = None
+        self.batch_size = batch_size
         self.is_trained = False
     
-    def train(self, features):
-        """使用K-means聚类训练量化器"""
-        print(f"Training K-means with {len(features)} samples...")
-        self.kmeans = KMeans(
-            n_clusters=self.n_clusters, 
-            random_state=0, 
-            n_init=10,
-            verbose=1
+    def train(self, feature_generator):
+        print("Training MiniBatchKMeans with streaming features...")
+        self.kmeans = MiniBatchKMeans(
+            n_clusters=self.n_clusters,
+            batch_size=self.batch_size,
+            random_state=0,
+            verbose=1,
+            max_iter=300,
+            init="k-means++",
+
         )
-        self.kmeans.fit(features)
+    
+        buffer = []
+        for feat in feature_generator:
+            buffer.append(feat)
+            if len(buffer) >= self.batch_size:
+                batch = np.vstack(buffer)
+                self.kmeans.partial_fit(batch)
+                buffer = []
+    
+        if buffer:
+            batch = np.vstack(buffer)
+            self.kmeans.partial_fit(batch)
+    
         self.is_trained = True
-        print("K-means training completed.")
+        print("MiniBatchKMeans streaming training completed.")
+    
+    def train_with_weight(self,feature_generator, dataset , hubert_model):
+        print("Running warm-up MiniBatchKMeans to estimate frequencies...")
+        def make_gen():
+            return extract_hubert_features_generator(dataset, hubert_model)
+
+        tmp = MiniBatchKMeans(
+            n_clusters=self.n_clusters,
+            batch_size=self.batch_size,
+            random_state=0,
+            max_iter=2,          # 只做2次迭代
+            init="k-means++"
+        )
+        # 第一次遍历：收集所有特征 + 预热
+        weights = []
+        buffer = []
+        for feat in tqdm(feature_generator, desc="Warm-up"):
+            buffer.append(feat)
+            if len(buffer) >= self.batch_size:
+                batch = np.vstack(buffer)
+                tmp.partial_fit(batch)
+                buffer = []
+    
+        if buffer:
+            batch = np.vstack(buffer)
+            tmp.partial_fit(batch)
+        # 第二次遍历：按预热模型给每帧赋权重
+        print("Computing sample weights...")
+        for feat in tqdm(make_gen(), desc="Weighting"):
+            labels = tmp.predict(feat)
+            unique, counts = np.unique(labels, return_counts=True)
+            freq = np.zeros(self.n_clusters)
+            freq[unique] = counts
+            w_frame = 1.0 / (freq[labels] + 1e-8)
+            weights.append(w_frame)
+        # 第三次遍历：正式训练（带权重）
+        print("Training MiniBatchKMeans with sample weights...")
+        self.kmeans = MiniBatchKMeans(
+            n_clusters=self.n_clusters,
+            batch_size=self.batch_size,
+            random_state=0,
+            max_iter=300,
+            init="k-means++",
+            n_init = 10
+        )
+
+        buffer = []
+        ww = []
+        for idx, feat in enumerate(make_gen()):
+            buffer.append(feat)
+            ww.append(weights[idx])
+            # print(weights[idx])
+            if len(buffer) >= self.batch_size:
+                batch = np.vstack(buffer)
+                we = np.hstack(ww)
+                self.kmeans.partial_fit(batch,sample_weight=we)
+                buffer = []
+                ww = []
+    
+        if buffer and ww:
+            batch = np.vstack(buffer)
+            we = np.hstack(ww)
+            self.kmeans.partial_fit(batch,sample_weight=we)
+        
+        self.is_trained = True
+        print("Weighted MiniBatchKMeans training completed.")
+
+    def postprocess_empty_clusters(self, feature_generator):
+        if not self.is_trained:
+            raise RuntimeError("K-means not trained yet")
+        print("Post-processing empty clusters...")
+        all_labels = []
+        for feat in tqdm(feature_generator, desc="Collecting labels"):
+            labels = self.predict(feat)
+            all_labels.append(labels)
+        all_labels = np.concatenate(all_labels)
+        used = np.unique(all_labels)
+        empty = np.setdiff1d(np.arange(self.n_clusters), used)
+        if len(empty) == 0:
+            print("No empty clusters found.")
+            return
+        # 高频簇索引（按出现次数排序）
+        counts = np.bincount(all_labels, minlength=self.n_clusters)
+        high_freq_idx = np.argsort(-counts)
+        # 把空簇替换为高频簇中心 + 小噪声
+        for e in empty:
+            donor = high_freq_idx[0] if len(high_freq_idx) else 0
+            self.kmeans.cluster_centers_[e] = (
+                self.kmeans.cluster_centers_[donor]
+                + np.random.normal(0, 0.01, size=self.kmeans.cluster_centers_.shape[1])
+            )
+        print(f"Replaced {len(empty)} empty clusters.")
     
     def predict(self, features):
         """预测特征对应的聚类索引"""
@@ -187,10 +299,7 @@ class KMeansQuantizer:
         if not self.is_trained:
             raise RuntimeError("K-means model not trained yet")
         
-        # 首先获取每个特征的聚类索引
         cluster_indices = self.kmeans.predict(features)
-        
-        # 然后根据索引获取对应的聚类中心向量
         centroids = self.kmeans.cluster_centers_[cluster_indices]
         
         return centroids
@@ -261,17 +370,17 @@ class KMeansCTCASR(nn.Module):
         
         # K-means量化器
         self.quantizer = quantizer
-        # self.ctc_loss = FocalCTCLoss(alpha=0.25, gamma=2.0, blank=tokenizer.blank_token_id)
+        self.ctc_loss = FocalCTCLoss(alpha=0.25, gamma=2.0, blank=tokenizer.blank_token_id)
         # 编码器
         self.encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=config.embedding_dim,
                 nhead=8,
-                dim_feedforward=1536,  # 增加维度以处理稀疏性
+                dim_feedforward=2048,  
                 dropout=0.1,
                 batch_first=True
             ),
-            num_layers=2  # 增加层数以提高性能
+            num_layers=8  
         )
         
         # 输出层
@@ -285,22 +394,9 @@ class KMeansCTCASR(nn.Module):
         # CTC损失函数
         # nn.init.xavier_uniform_(self.output_layer.weight)
         # nn.init.constant_(self.output_layer.bias[tokenizer.blank_token_id], -20.0)
-        self.ctc_loss = nn.CTCLoss(blank=config.blank_token, reduction='mean')
+        # self.ctc_loss = nn.CTCLoss(blank=config.blank_token, reduction='mean')
         self.positional_encoding = PositionalEncoding(config.embedding_dim)
         self.eembedding = nn.Embedding(config.kmeans_n_clusters, config.embedding_dim)
-        # CTC解码器
-        # self.ctc_decoder = CTCBeamDecoder(
-        #     list(self.quantizer.kmeans.labels_),
-        #     model_path=config.lm_path,
-        #     alpha=0.5,
-        #     beta=1.5,
-        #     cutoff_top_n=40,
-        #     cutoff_prob=1.0,
-        #     beam_width=config.beam_width,
-        #     num_processes=4,
-        #     blank_id=config.blank_token,
-        #     log_probs_input=True
-        # )
     
     def forward(self, input_values, attention_mask, labels=None, label_lengths=None):
         # 提取HuBERT特征
@@ -308,11 +404,37 @@ class KMeansCTCASR(nn.Module):
             outputs = self.hubert(input_values, attention_mask=attention_mask)
             features = outputs.last_hidden_state
         
+        batch_size, seq_len, feat_dim = features.shape
+        mask_ratio = input_values.shape[1] / features.shape[1]  
+        mask_downsample = F.avg_pool1d(
+            attention_mask.float().unsqueeze(1), 
+            kernel_size=int(mask_ratio), 
+            stride=int(mask_ratio)
+        ).squeeze(1) > 0.05  
+        # 仅保留有效特征
+        valid_features = []
+        valid_lengths = []
+        for i in range(features.size(0)):
+            valid_idx = torch.where(mask_downsample[i])[0]
+            valid_features.append(features[i, valid_idx])
+            valid_lengths.append(len(valid_idx))
+        
+        # 填充
+        features_padded = pad_sequence(valid_features, batch_first=True)
+        # 量化仅作用于有效特征
+        valid_feat_list = []
+        for i in range(features_padded.size(0)):
+            valid_len = valid_lengths[i]
+            valid_feat = features_padded[i, :valid_len, :]   
+            valid_feat_list.append(valid_feat.cpu().numpy())
+        
+        valid_feat_flat = np.vstack(valid_feat_list)
+        quant_indices = self.quantizer.predict(valid_feat_flat)
+    
         # 量化
         # print("Feature std per time step:", features.std(dim=1).mean().item())
-        batch_size, seq_len, feat_dim = features.shape
-        features_flat = features.reshape(-1, feat_dim).cpu().numpy()
-        quant_indices = self.quantizer.predict(features_flat)
+        # features_flat = features.reshape(-1, feat_dim).cpu().numpy()
+        # quant_indices = self.quantizer.predict(features_flat)
         quant_indices = torch.tensor(quant_indices, dtype=torch.long, device=config.device)
         quant_indices = quant_indices.reshape(batch_size, seq_len)
         # quant_indices = quant_indices + (features - features.detach())
@@ -323,26 +445,26 @@ class KMeansCTCASR(nn.Module):
         # 嵌入层
         embedded = self.eembedding(quant_indices)
         # embedded = embedded + (features - features.detach())
-        print(embedded)
+        # print(embedded)
         # 编码器处理
-        encoded = self.encoder(embedded)
+        encoded = self.encoder(embedded,src_key_padding_mask=~mask_downsample)
         # print(encoded)
         # 输出层
         logits = self.output_layer(self.positional_encoding(encoded))
-        print(torch.argmax(logits, dim=-1))
+        # print(torch.argmax(logits, dim=-1))
         log_probs = F.log_softmax(logits, dim=-1)
         # print(log_probs)
         
         if labels is not None:
             # 计算CTC损失
             # print(labels)
-            input_lengths = torch.full((batch_size,), seq_len, dtype=torch.long, device=config.device)
+            input_lengths = torch.tensor(valid_lengths, device=config.device)  # 使用实际长度
             valid_labels = labels[labels != -1]  # 移除填充的占位符
             loss = self.ctc_loss(
-                log_probs.permute(1, 0, 2),  # (T, N, C)
-                valid_labels,                # (N, S)
-                input_lengths,               # (N)
-                label_lengths                # (N)
+                log_probs.permute(1, 0, 2),  
+                valid_labels,                
+                input_lengths,               
+                label_lengths                
             )
             aux_head = nn.Linear(config.embedding_dim, self.tokenizer.vocab_size).to(config.device)
             aux_loss = F.cross_entropy(aux_head(encoded[:,0]), labels[:,0])  # 首帧分类
@@ -354,13 +476,13 @@ class KMeansCTCASR(nn.Module):
     def decode(self, log_probs):
         probs = torch.exp(log_probs)
         log_probs_np = probs.detach().cpu().numpy()
-        print(log_probs_np[0])
+        # print(log_probs_np[0])
         decoded_texts = []
         vocab_list = list(self.tokenizer.vocab.keys())
         # vocab_list[0] = ' '
         for i in range(log_probs_np.shape[0]):  # 逐样本处理
             text, _ = beam_search(
-                log_probs_np[i],                # 单样本概率矩阵 [T, vocab_size]
+                log_probs_np[i],                
                 alphabet=vocab_list,
                 beam_size=config.beam_width,
                 # blank_id=config.blank_token,
@@ -498,7 +620,7 @@ def validate(model, tokenizer, val_loader):
             pred_texts = model.decode(log_probs)
             
             # 计算指标
-            print(texts[0],"val0",pred_texts[0])
+            # print(texts[0],"val0",pred_texts[0])
             for i in range(len(texts)):
                 ref = texts[i]
                 hyp = pred_texts[i]
@@ -570,7 +692,30 @@ def test(model, tokenizer, test_loader):
     
     return final_cer
 
-# 提取HuBERT特征
+def extract_hubert_features_generator(dataset, hubert_model, batch_size=100):
+    hubert_model.eval()
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        input_values = sample["input_values"].unsqueeze(0).to(config.device)
+        attention_mask = sample["attention_mask"].unsqueeze(0).to(config.device)
+
+        with torch.no_grad():
+            outputs = hubert_model(input_values, attention_mask=attention_mask)
+            features = outputs.last_hidden_state
+
+        mask_ratio = input_values.shape[1] / features.shape[1]
+        mask_downsample = F.avg_pool1d(
+            attention_mask.float().unsqueeze(1),
+            kernel_size=int(mask_ratio),
+            stride=int(mask_ratio)
+        ).squeeze(1) > 0.05
+
+        valid_idx = torch.where(mask_downsample[0])[0]
+        valid_features = features[0, valid_idx].cpu().numpy()
+
+        yield valid_features
+
+# 提取HuBERT特征（内存占用过大，未启用）
 def extract_hubert_features(dataset, hubert_model):
     all_features = []
     
@@ -582,10 +727,24 @@ def extract_hubert_features(dataset, hubert_model):
         
         with torch.no_grad():
             outputs = hubert_model(input_values, attention_mask=attention_mask)
-            features = outputs.last_hidden_state.squeeze(0).cpu().numpy()
+            features = outputs.last_hidden_state
         
-        all_features.append(features)
+        mask_ratio = input_values.shape[1] / features.shape[1]  
+        mask_downsample = F.avg_pool1d(
+            attention_mask.float().unsqueeze(1), 
+            kernel_size=int(mask_ratio), 
+            stride=int(mask_ratio)
+        ).squeeze(1) > 0.05  
+        valid_features = []
+        valid_lengths = []
+        for i in range(features.size(0)):
+            valid_idx = torch.where(mask_downsample[i])[0]  
+            valid_features.append(features[i, valid_idx].cpu().numpy())
+            valid_lengths.append(len(valid_idx))
     
+        all_features.append(valid_features[0])
+        # print(all_features)
+
     # 合并所有特征
     all_features = np.vstack(all_features)
     print(f"Extracted {all_features.shape[0]} features of dimension {all_features.shape[1]}")
@@ -625,21 +784,20 @@ def main():
     
     # 训练或加载K-means量化器
     quantizer = KMeansQuantizer(n_clusters=config.kmeans_n_clusters)
-    val_size1 = int(len(train_dataset) * 0.75)
-    train_size1 = len(train_dataset) - val_size1
-    train_dataset, _ = random_split(
-        train_dataset, [train_size1, val_size1]
-    )
+    # val_size1 = int(len(train_dataset) * 0.99)
+    # train_size1 = len(train_dataset) - val_size1
+    # train_dataset, _ = random_split(
+    #     train_dataset, [train_size1, val_size1]
+    # )
     if os.path.exists(config.kmeans_model_path):
         quantizer.load(config.kmeans_model_path)
     else:
         # 提取特征并训练K-means
-        features = extract_hubert_features(train_dataset, hubert_model)
-        quantizer.train(features)
+        feature_gen = extract_hubert_features_generator(train_dataset, hubert_model)
+        quantizer.train_with_weight(feature_gen , train_dataset, hubert_model)
         quantizer.save(config.kmeans_model_path)
     
-    # 重新加载完整训练数据集
-    # train_dataset = AISHELLDataset(config.train_dir, config.transcript_path)
+    train_dataset = AISHELLDataset(config.train_dir, config.transcript_path)
     # 划分训练集和验证集
     val_size = int(len(train_dataset) * config.val_ratio)
     train_size = len(train_dataset) - val_size
@@ -687,11 +845,11 @@ def main():
     optimizer = optim.AdamW(
         model.parameters(), 
         lr=config.lr,
-        weight_decay=0.01  # 权重衰减防止过拟合
+        weight_decay=0.01  
     )
     
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2, verbose=True
+        optimizer, mode='min', factor=0.5, patience=2
     )
     
     # 训练模型

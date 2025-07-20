@@ -1,0 +1,9 @@
+torch
+torchaudio
+transformers
+numpy
+jiwer
+scikit-learn
+joblib
+tqdm
+fast-ctc-decode
